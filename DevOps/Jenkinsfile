@@ -1,0 +1,181 @@
+pipeline {
+    agent none
+
+    environment {
+        NEXUS_REGISTRY_URL = '10.10.70.84:30051'
+        IMAGE_NAME         = 'docker-host/my-node-app'      
+        NEXUS_CRED_ID      = 'a4116a00-2da0-4947-9dcc-86ba51217d6d'
+        K8S_NAMESPACE      = 'deplyment'
+        IMAGE_TAG          = "latest-${env.BUILD_NUMBER}"
+        DOCKER_CONFIG_JSON = ""
+    }
+
+    stages {
+
+        // STAGE 1: CHECKOUT AND STASH
+        stage('Checkout') {
+            agent any
+            steps {
+                echo "Checking out code from Gitea..."
+                checkout scm
+
+                echo "Stashing source code..."
+                stash name: 'source', includes: '**/*'
+            }
+        }
+
+        
+        // STAGE 2: UNSTASH AND TEST THE APP
+        stage('Test Application') {
+            agent {
+                kubernetes {
+                    cloud 'kubernetes'
+                    yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: node
+    image: node:18-alpine
+    imagePullPolicy: Always
+    command: ["cat"]
+    args: ["-"]
+    tty: true
+'''
+                }
+            }
+            steps {
+                container('node') {
+                    echo "Unstashing source code..."
+                    unstash 'source'
+
+                    echo "Running tests..."
+                    sh 'npm install'
+                    // Added '--' so npm passes the flag to Jest
+                    sh 'npm test -- --passWithNoTests'
+                }
+            }
+        }
+        
+
+        // STAGE 3: BUILD AND PUSH THE IMAGE TO NEXUS
+        stage('Build and Push') {
+            agent {
+                kubernetes {
+                    cloud 'kubernetes'
+                    yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:debug
+    imagePullPolicy: Always
+    command: ["cat"]
+    args: ["-"]
+    tty: true
+'''
+                }
+            }
+            steps {
+                container('kaniko') {
+                    echo "Unstashing source code..."
+                    unstash 'source'
+
+                    withCredentials([usernamePassword(credentialsId: NEXUS_CRED_ID, usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')]) {
+
+                        script {
+                            def encodedAuth = sh(
+                                script: "echo -n \"${NEXUS_USER}:${NEXUS_PASS}\" | base64",
+                                returnStdout: true
+                            ).trim()
+
+                            DOCKER_CONFIG_JSON = "{\"auths\":{\"${NEXUS_REGISTRY_URL}\":{\"auth\":\"${encodedAuth}\"}}}"
+                        }
+
+                        sh "echo '${DOCKER_CONFIG_JSON}' > /kaniko/.docker/config.json"
+
+                        echo "Running Kaniko build..."
+                        sh """
+                        /kaniko/executor \\
+                            --context=\$(pwd) \\
+                            --dockerfile=Dockerfile \\
+                            --destination=${NEXUS_REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG} \\
+                            --skip-tls-verify \\
+                            --insecure \\
+                            --cache=true
+                        """
+                    }
+                }
+            }
+        }
+
+        // STAGE 4: DEPLOY THE APP TO KUBERNETES
+        stage('Deploy') {
+            agent {
+                kubernetes {
+                    cloud 'kubernetes'
+                    yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: kubectl
+    image: lachlanevenson/k8s-kubectl:latest
+    imagePullPolicy: Always
+    command:
+      - cat
+    args:
+      - "-"
+    tty: true
+    volumeMounts:
+      - name: kubeconfig
+        mountPath: /root/.kube
+        readOnly: true
+  volumes:
+    - name: kubeconfig
+      hostPath:
+        path: /home/zeid/.kube
+        type: Directory
+'''
+                }
+            }
+            steps {
+                container('kubectl') {
+                    echo "Unstashing source code..."
+                    unstash 'source'
+                            withCredentials([usernamePassword(
+                            credentialsId: NEXUS_CRED_ID,
+                            usernameVariable: 'NEXUS_USER',
+                            passwordVariable: 'NEXUS_PASS'
+                        )]) {
+                            
+                            sh """
+                            kubectl create secret docker-registry nexus-cred \\
+                                --docker-server=${NEXUS_REGISTRY_URL} \\
+                                --docker-username=${NEXUS_USER} \\
+                                --docker-password=${NEXUS_PASS} \\
+                                --docker-email=zeid@local \\
+                                --namespace ${K8S_NAMESPACE} \\
+                                --dry-run=client -o yaml | kubectl apply -f -
+                            """
+                        }
+
+                    
+                    echo "Deploying to Kubernetes in namespace: ${K8S_NAMESPACE}"
+                    sh "kubectl apply -f deployment.yaml --namespace ${K8S_NAMESPACE}"
+
+                    sh """
+                    kubectl set image deployment/my-node-app \
+                        my-node-app-container=${NEXUS_REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG} \
+                        --namespace ${K8S_NAMESPACE}
+                    """
+
+                    sh "kubectl rollout status deployment/my-node-app --namespace ${K8S_NAMESPACE}"
+
+                    echo "Deployment successful!"
+                }
+            }
+        }
+    }
+}
