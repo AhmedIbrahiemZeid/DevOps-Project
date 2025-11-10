@@ -1,0 +1,141 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitee
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc
+  namespace: gitee
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: sc
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gitee-data
+  namespace: gitee
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: sc
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  namespace: gitee
+spec:
+  selector:
+    matchLabels:
+      app: mysql
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:5.7
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: admin123
+            - name: MYSQL_DATABASE
+              value: gitee
+            - name: MYSQL_USER
+              value: admin
+            - name: MYSQL_PASSWORD
+              value: admin123
+          ports:
+            - containerPort: 3306
+          volumeMounts:
+            - name: mysql-storage
+              mountPath: /var/lib/mysql
+      volumes:
+        - name: mysql-storage
+          persistentVolumeClaim:
+            claimName: mysql-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: gitee
+spec:
+  ports:
+    - port: 3306
+  selector:
+    app: mysql
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitee
+  namespace: gitee
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gitee
+  template:
+    metadata:
+      labels:
+        app: gitee
+    spec:
+      containers:
+        - name: gitee
+          image: gitee-ce/gitee:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          env:
+            - name: GITEE_DB_HOST
+              value: mysql
+            - name: GITEE_DB_PORT
+              value: "3306"
+            - name: GITEE_DB_USER
+              value: admin
+            - name: GITEE_DB_PASSWD
+              value: admin123
+            - name: GITEE_DB_NAME
+              value: gitee
+          volumeMounts:
+            - name: gitee-data
+              mountPath: /data
+      volumes:
+        - name: gitee-data
+          persistentVolumeClaim:
+            claimName: gitee-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitee
+  namespace: gitee
+spec:
+  selector:
+    app: gitee
+  ports:
+    - port: 3000
+      targetPort: 3000
+      nodePort: 30060
+  type: NodePort
+
